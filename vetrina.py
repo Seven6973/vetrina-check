@@ -154,16 +154,50 @@ def cdp_images(url: str, endpoint: str = "http://127.0.0.1:9222", attesa: float 
 
     Serve per i siti che disegnano tutto via JavaScript: li' l'HTML statico e' vuoto e
     l'analisi statica direbbe "0 foto", che e' falso. La scheda viene chiusa a fine lavoro.
+
+    Due trappole verificate su siti veri (30/09/2026, enotecabonbon.it):
+    * la pagina si disegna solo se la scheda e' VISIBILE -> `Target.activateTarget`, altrimenti
+      resta vuota e sembra un sito morto;
+    * i contenuti possono stare dentro uno **shadow root**: `document.images` non li vede
+      (restituisce 0 mentre a schermo le foto ci sono). Percio' si scende nei shadow root e si
+      contano anche le `background-image`.
+    Il risultato si aspetta: si interroga la pagina finche' non compaiono immagini (max ~attesa*2).
     """
     try:
         import websockets  # dipendenza opzionale: solo per questa modalita'
     except ImportError as e:  # pragma: no cover
         raise RuntimeError("manca il pacchetto 'websockets' (pip install websockets)") from e
 
-    import time
-
     ver = json.load(urllib.request.urlopen(endpoint + "/json/version", timeout=10))
-    out: dict = {"url_finale": url, "foto": [], "peso_mb": 0.0, "media_rotti": 0, "video": 0}
+    out: dict = {"url_finale": url, "foto": [], "media_rotti": 0, "video": 0}
+    expr = """(() => {
+        const out = [];
+        const visti = new Set();
+        const spingi = (src, alt) => {
+            if (!src || src.startsWith('data:') || visti.has(src)) return;
+            visti.add(src);
+            out.push({src: src, alt: alt || ''});
+        };
+        const cammina = (root) => {
+            root.querySelectorAll('img').forEach(i => { if (i.naturalWidth > 2) spingi(i.currentSrc || i.src, i.alt); });
+            root.querySelectorAll('*').forEach(e => {
+                const b = getComputedStyle(e).backgroundImage;
+                if (b && b !== 'none' && b.includes('url(')) {
+                    spingi(b.slice(b.indexOf('url(') + 4, b.lastIndexOf(')')).replace(/["']/g, ''),
+                           e.getAttribute('aria-label'));
+                }
+                if (e.shadowRoot) cammina(e.shadowRoot);
+            });
+        };
+        cammina(document);
+        const vids = document.querySelectorAll('video, iframe[src*="youtube"], iframe[src*="vimeo"]').length;
+        return JSON.stringify({
+            url: location.href, video: vids, imgs: out.slice(0, 200),
+            rotti: Array.from(document.querySelectorAll('img')).filter(i => i.complete && i.naturalWidth === 0).length,
+            testo: (document.body.innerText || document.body.textContent || '').length,
+            visibile: document.visibilityState
+        });
+    })()"""
 
     async def run():
         async with websockets.connect(ver["webSocketDebuggerUrl"], max_size=42 * 1024 * 1024) as ws:
@@ -182,38 +216,24 @@ def cdp_images(url: str, endpoint: str = "http://127.0.0.1:9222", attesa: float 
 
             t = await call("Target.createTarget", {"url": url})
             tid = t["result"]["targetId"]
+            await call("Target.activateTarget", {"targetId": tid})       # senza questo la pagina resta vuota
             try:
                 at = await call("Target.attachToTarget", {"targetId": tid, "flatten": True})
                 sid = at["result"]["sessionId"]
                 await asyncio.sleep(attesa)
-                expr = """(() => {
-                    const visti = new Set();
-                    const imgs = Array.from(document.images).filter(i => i.naturalWidth > 2);
-                    document.querySelectorAll('*').forEach(e => {
-                        const b = getComputedStyle(e).backgroundImage;
-                        if (b && b !== 'none' && b.includes('url(')) {
-                            const u = b.slice(b.indexOf('url(') + 4, b.lastIndexOf(')')).replace(/["']/g, '');
-                            if (u && !u.startsWith('data:')) imgs.push({currentSrc: u, alt: e.getAttribute('aria-label') || '', naturalWidth: 100, naturalHeight: 100});
-                        }
-                    });
-                    const uniq = imgs.filter(i => {const u = i.currentSrc || i.src; if (visti.has(u)) return false; visti.add(u); return true;});
-                    const vids = document.querySelectorAll('video, iframe[src*="youtube"], iframe[src*="vimeo"]').length;
-                    return JSON.stringify({
-                        url: location.href,
-                        video: vids,
-                        imgs: uniq.map(i => ({src: i.currentSrc || i.src, alt: i.alt || '',
-                                              w: i.naturalWidth, h: i.naturalHeight})).slice(0, 200),
-                        rotti: Array.from(document.images).filter(i => i.complete && i.naturalWidth === 0).length,
-                        testo: (document.body.innerText || '').length
-                    });
-                })()"""
-                r = await call("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session=sid)
-                d = json.loads(r["result"]["result"]["value"])
-                out["url_finale"] = d["url"]
-                out["foto"] = d["imgs"]
-                out["media_rotti"] = d["rotti"]
-                out["video"] = d["video"]
-                out["lunghezza_testo"] = d["testo"]
+                for _ in range(7):                                       # aspetta che il contenuto compaia
+                    r = await call("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session=sid)
+                    d = json.loads((r.get("result", {}).get("result") or {}).get("value") or "{}")
+                    if d.get("imgs"):
+                        break
+                    await asyncio.sleep(attesa / 2)
+                if not d:
+                    d = {"imgs": [], "video": 0, "rotti": 0, "url": url}
+                out["url_finale"] = d.get("url", url)
+                out["foto"] = d.get("imgs", [])
+                out["media_rotti"] = d.get("rotti", 0)
+                out["video"] = d.get("video", 0)
+                out["lunghezza_testo"] = d.get("testo", 0)
             finally:
                 await call("Target.closeTarget", {"targetId": tid})
 
